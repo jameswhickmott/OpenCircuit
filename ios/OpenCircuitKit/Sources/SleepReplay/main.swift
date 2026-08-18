@@ -409,6 +409,27 @@ for ringID in byRing.keys.sorted() {
     }
     print("    (* = shipping default;  off = gate disabled, pre-#204 behaviour)")
 
+    // ── 9c. Wake-OFFSET pass sweep ───────────────────────────────────────────────────────
+    // Which pass called final wake? `offsetNoReturnSpreadFraction` derives its margin from the
+    // night's OWN spread (median − floor), so a settled night with a small spread gets a
+    // hair-trigger margin. 0 disables the pass; if wake jumps when it does, that pass owns it.
+    rule("9c. wake-offset pass — offsetNoReturnSpreadFraction sweep (default \(d.offsetNoReturnSpreadFraction))")
+    // ⚠️ BOTH trailing passes gate on the SAME `resolvedOffsetMargin`, so zeroing
+    // `offsetNoReturnSpreadFraction` disables the CADENCE pass too and cannot attribute a cut.
+    // `cadenceWakeQuietEpochs: 0` is the only knob that isolates one of them.
+    let combos: [(String, SleepStaging.Tuning)] = [
+        ("shipping default          ", SleepStaging.Tuning()),
+        ("both trailing passes OFF  ", SleepStaging.Tuning(offsetNoReturnSpreadFraction: 0)),
+        ("cadence OFF, no-return ON ", SleepStaging.Tuning(cadenceWakeQuietEpochs: 0)),
+        ("desk gate OFF             ", SleepStaging.Tuning(deskWakeZeroShareThreshold: 0)),
+    ]
+    print("    configuration               onset            wake             asleep")
+    for (label, tn) in combos {
+        let sg = SleepStaging.classify(from: night, temperatures: tempsInSpan, epoch: epoch, tuning: tn)
+        let w = SleepStaging.sleepWindow(sg)
+        print("    \(label)\(t(w?.onset).padded(17))\(t(w?.wake).padded(17))\(dur(SleepStaging.totalAsleep(sg)))")
+    }
+
     // ── 9. Naps ──────────────────────────────────────────────────────────────────────────
     // A SEPARATE path to Apple Health. `NapDetection.naps` writes every accepted daytime
     // still-block as sleep (`HealthKitWriter.flushNaps`), with its own staged Deep/Light/REM

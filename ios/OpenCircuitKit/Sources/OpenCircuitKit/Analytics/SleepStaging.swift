@@ -694,6 +694,11 @@ public enum SleepStaging {
         // (a leading epoch with no HR yet). Idle epochs report quiet-by-template rather than by
         // measurement, so they are excluded from the evidence exactly as `activityQuietTimeline` does.
         var rowDeskAwake: [Bool] = []
+        // Parallel to `rows`: the RAW per-epoch "the ring scored this epoch as motionless" flag —
+        // NOT the windowed verdict above. The trailing-edge guard in `markPointOfNoReturnOffset`
+        // needs the unsmoothed record, because a centred window at the very end of the night is
+        // dominated by the sleep BEHIND it and blurs the getting-up transition it must find.
+        var rowQuiet: [Bool] = []
         let deskAwakeAll: [Bool] = {
             let quiet = inBlock.map {
                 ActivityQuietSample(time: $0.date(epoch: epoch),
@@ -725,6 +730,7 @@ public enum SleepStaging {
             rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR, r.hrvRMSSD != nil))
             rowLayouts.append(r.layout)
             rowDeskAwake.append(deskAwakeAll[idx])
+            rowQuiet.append(r.layout == .idle ? true : r.activityMagnitudesAreZero)
         }
         guard rows.count >= 2 else { return [] }
 
@@ -865,6 +871,7 @@ public enum SleepStaging {
                               cadence: cadenceSteps(times: rows.map(\.time), layouts: rowLayouts),
                               smHR: smHR, floor: sleepFloor,
                               margin: resolvedOffsetMargin(hr: hr, floor: sleepFloor, tuning: tuning),
+                              activityQuiet: rowQuiet,
                               notBefore: lastRescuedIndex, tuning: tuning)
 
         // --- ONSET / OFFSET: trim leading & trailing awake -------------------------
@@ -1378,6 +1385,12 @@ public enum SleepStaging {
         awake = candidate
     }
 
+    /// Consecutive epochs the ring must score as MOVING before the trailing activity-record guard
+    /// will move a cadence cut. Two epochs (5 min) mirrors the "at least two non-zero tail epochs"
+    /// bar `BulkSleep.motionSource` already requires before it will trust this channel at all —
+    /// enough that one stray magnitude cannot move a validated wake.
+    static let minMovementRunEpochs = 2
+
     // MARK: - SpO2-cadence wake locator (#190)
 
     /// What one epoch-to-epoch step says about the ring's SpO2 duty cycle.
@@ -1491,8 +1504,8 @@ public enum SleepStaging {
     /// record fixture carries a constant motion byte that de-floors to "still" everywhere, so an "awake"
     /// fixture stages as sleep and the assertions go vacuous. Its tests drive it directly.
     static func markCadenceWakeOffset(_ awake: inout [Bool], cadence: [CadenceStep], smHR: [Double],
-                                      floor: Double, margin: Double, notBefore: Int? = nil,
-                                      tuning: Tuning) {
+                                      floor: Double, margin: Double, activityQuiet: [Bool] = [],
+                                      notBefore: Int? = nil, tuning: Tuning) {
         guard tuning.cadenceWakeQuietEpochs > 0, margin > 0,
               !awake.isEmpty, cadence.count == awake.count, smHR.count == awake.count,
               let (lo, _) = sleepSpan(awake, sustain: tuning.onsetSustainEpochs) else { return }
@@ -1521,12 +1534,60 @@ public enum SleepStaging {
         guard run.terminator == .violation else { return }   // data edge or hole: no wake observed
         guard run.length <= tuning.cadenceWakeMaxQuietEpochs else { return }   // not a night
 
-        let s = run.end + 1
+        var s = run.end + 1
         // `> earliest`, not `>=`: the onset epoch (and the last rescued epoch) must remain asleep.
         guard s < n, s > earliest else { return }
+
+        // ACTIVITY-RECORD GUARD (#204, trailing edge).
+        //
+        // This pass reads the RING (where its SpO2 duty cycle broke), and its HR confirmation above
+        // reads the BODY. Neither reads MOVEMENT — so when the cadence lapses while the wearer is
+        // still asleep, both witnesses agree on a wake that never happened.
+        //
+        // 🟢 MEASURED on the 2026-08-19 night (FR02.018, Australia/Melbourne; wearer woken abruptly
+        // at ~07:07, corroborated by CPAP mask-off at 07:06:58). The cadence broke at ~06:36 and this
+        // pass cut there — THIRTY-FOUR MINUTES early. Not retunable through the shared margin:
+        // `offsetNoReturnSpreadFraction` 0.25 / 0.50 / 0.75 / 1.00 all yield 06:33:36, and only
+        // `cadenceWakeQuietEpochs: 0` (disabling this pass outright) moves it. Meanwhile the ring
+        // reported HR 65–72 against a 79 threshold, motion flat at baseline, sleep-vitals with HRV at
+        // FULL cadence, and activity magnitudes of ZERO across the cut, going hard non-zero
+        // (778 → 7965 → 3515) exactly at 07:06 — the real getting-up.
+        //
+        // ⚠️ POSITIVE EVIDENCE ONLY, AND THAT IS THE WHOLE DESIGN. An earlier revision vetoed the cut
+        // whenever the epochs after it read quiet, which is WRONG twice over and was caught by this
+        // file's own tests: (a) `activityMagnitudesAreZero` is true on 30 % of real corpus records
+        // and on 100 % of every SYNTHETIC fixture, so "all quiet" is indistinguishable from "this
+        // record set carries no activity information" — absence of data read as evidence of
+        // stillness, the exact error the wear gate, the HR gate and the terminal-REM guard each
+        // refuse to make; and (b) it anchored on the END of the data, so the answer moved with the
+        // truncation point — reintroducing the sync-time dependence #190 exists to remove.
+        //
+        // So the guard only ever acts on POSITIVE evidence: it looks FORWARD from the proposed cut
+        // for a sustained run of epochs the ring scored as MOVING, and moves the cut to the start of
+        // that run. No such run — including every all-quiet fixture — leaves the cut exactly where
+        // the cadence put it, so this pass keeps its measured behaviour and stays scope-independent.
+        // ONE-DIRECTIONAL: the cut can only move LATER, i.e. only ever ADD sleep back.
+        if tuning.deskWakeZeroShareThreshold > 0,
+           !activityQuiet.isEmpty, activityQuiet.count == n {
+            var runStart: Int?
+            var run = 0
+            for i in s ..< n {
+                if activityQuiet[i] { run = 0; continue }
+                run += 1
+                if run >= minMovementRunEpochs { runStart = i - run + 1; break }
+            }
+            // Only a MOVEMENT run may move the cut. Its absence is not evidence of anything.
+            if let moved = runStart, moved > s {
+                s = moved
+                guard s < n, s > earliest else { return }
+            }
+        }
+
         // HR NO-RETURN CONFIRMATION — the same test `markPointOfNoReturnOffset` scans for, used here
         // as a second, INDEPENDENT witness on a cut the cadence has already located. The cadence says
         // where the ring stopped measuring sleep; this says the body never settled back afterwards.
+        // Evaluated AFTER the activity guard so it judges the cut that will actually be committed:
+        // moving the cut later shortens the suffix, and the suffix is exactly what it tests.
         guard let suffixMin = smHR[s...].min(), suffixMin > floor + margin else { return }
 
         var candidate = awake
