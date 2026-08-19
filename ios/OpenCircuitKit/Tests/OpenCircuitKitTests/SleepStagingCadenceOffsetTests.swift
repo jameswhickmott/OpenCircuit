@@ -405,4 +405,90 @@ final class SleepStagingCadenceOffsetTests: XCTestCase {
         XCTAssertEqual(on, off, accuracy: 1)
         XCTAssertGreaterThan(off, 0, "fixture sanity: the night really does stage")
     }
+
+    // MARK: - Activity-record guard (#204, trailing edge)
+    //
+    // 🟢 GROUNDED on the 2026-08-19 night (FR02.018, Australia/Melbourne). The wearer was woken
+    // abruptly at ~07:07 — corroborated by CPAP mask-off at 07:06:58, so there was no lying in bed
+    // afterwards — and this pass cut final wake at 06:33:36, THIRTY-FOUR MINUTES early, because the
+    // ring's SpO2 duty cycle lapsed at ~06:36 while sleep continued. Not reachable through the shared
+    // margin: `offsetNoReturnSpreadFraction` 0.25 / 0.50 / 0.75 / 1.00 all produce 06:33:36. Across
+    // the cut the ring reported HR 65–72 (threshold 79), motion flat at baseline, sleep-vitals with
+    // HRV at full cadence, and activity magnitudes of ZERO — going hard non-zero (778 → 7965 → 3515)
+    // exactly at 07:06. With the guard the same archive stages wake at 07:03:36 (3½ min early).
+
+    /// Quiet through the cadence cut, then a real movement run: the cut moves to the movement.
+    func testActivityGuardMovesTheCutToTheMovementRun() {
+        var awake = asleepMask(120)
+        var quiet = [Bool](repeating: true, count: 120)
+        for i in 110 ..< 120 { quiet[i] = false }        // the getting-up
+        SleepStaging.markCadenceWakeOffset(&awake, cadence: cadence(n: 120, quietEnd: 99),
+                                           smHR: hrRisingAtEnd(n: 120, tail: 20),
+                                           floor: floor, margin: 4, activityQuiet: quiet,
+                                           tuning: .default)
+        XCTAssertEqual(awake.firstIndex(of: true), 110,
+                       "the cut must move to where the ring actually recorded movement")
+    }
+
+    /// ABSENCE IS NOT EVIDENCE. An all-quiet record set — every synthetic fixture, and any archive
+    /// whose activity block carries nothing — must leave the validated #190 behaviour untouched.
+    func testAllQuietActivityRecordLeavesTheCutUntouched() {
+        var awake = asleepMask(120)
+        SleepStaging.markCadenceWakeOffset(&awake, cadence: cadence(n: 120, quietEnd: 99),
+                                           smHR: hrRisingAtEnd(n: 120, tail: 20),
+                                           floor: floor, margin: 4,
+                                           activityQuiet: [Bool](repeating: true, count: 120),
+                                           tuning: .default)
+        XCTAssertEqual(awake.firstIndex(of: true), 100,
+                       "no movement evidence ⇒ the cadence cut stands exactly as before")
+    }
+
+    /// One stray magnitude is not a getting-up. Mirrors `BulkSleep.motionSource`'s own two-epoch bar.
+    func testStraySingleMovementEpochDoesNotMoveTheCut() {
+        var awake = asleepMask(120)
+        var quiet = [Bool](repeating: true, count: 120)
+        quiet[110] = false                                // a lone twitch
+        SleepStaging.markCadenceWakeOffset(&awake, cadence: cadence(n: 120, quietEnd: 99),
+                                           smHR: hrRisingAtEnd(n: 120, tail: 20),
+                                           floor: floor, margin: 4, activityQuiet: quiet,
+                                           tuning: .default)
+        XCTAssertEqual(awake.firstIndex(of: true), 100)
+    }
+
+    /// ONE-DIRECTIONAL: movement BEFORE the cadence cut can never drag wake earlier.
+    func testActivityGuardNeverMovesTheCutEarlier() {
+        var awake = asleepMask(120)
+        var quiet = [Bool](repeating: true, count: 120)
+        for i in 80 ..< 95 { quiet[i] = false }            // restless stretch well before the cut
+        SleepStaging.markCadenceWakeOffset(&awake, cadence: cadence(n: 120, quietEnd: 99),
+                                           smHR: hrRisingAtEnd(n: 120, tail: 20),
+                                           floor: floor, margin: 4, activityQuiet: quiet,
+                                           tuning: .default)
+        XCTAssertEqual(awake.firstIndex(of: true), 100,
+                       "the guard scans FORWARD from the cut; earlier movement is irrelevant")
+    }
+
+    /// Kill switch — shares the desk gate's one constant, so a single number reverts both layers.
+    func testActivityGuardKillSwitch() {
+        var awake = asleepMask(120)
+        var quiet = [Bool](repeating: true, count: 120)
+        for i in 110 ..< 120 { quiet[i] = false }
+        SleepStaging.markCadenceWakeOffset(&awake, cadence: cadence(n: 120, quietEnd: 99),
+                                           smHR: hrRisingAtEnd(n: 120, tail: 20),
+                                           floor: floor, margin: 4, activityQuiet: quiet,
+                                           tuning: SleepStaging.Tuning(deskWakeZeroShareThreshold: 0))
+        XCTAssertEqual(awake.firstIndex(of: true), 100,
+                       "threshold 0 ⇒ byte-identical to pre-#204")
+    }
+
+    /// A mismatched timeline is ignored rather than mis-indexed.
+    func testMismatchedActivityTimelineIsIgnored() {
+        var awake = asleepMask(120)
+        SleepStaging.markCadenceWakeOffset(&awake, cadence: cadence(n: 120, quietEnd: 99),
+                                           smHR: hrRisingAtEnd(n: 120, tail: 20),
+                                           floor: floor, margin: 4,
+                                           activityQuiet: [Bool](repeating: false, count: 7),
+                                           tuning: .default)
+        XCTAssertEqual(awake.firstIndex(of: true), 100)
+    }
 }
